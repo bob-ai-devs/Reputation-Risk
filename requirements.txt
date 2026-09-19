@@ -1,0 +1,24 @@
+streamlit>=1.36
+pandas>=2.0
+numpy>=1.26
+requests>=2.31
+beautifulsoup4>=4.12
+python-dateutil>=2.9
+nltk>=3.8
+matplotlib>=3.8
+seaborn>=0.13
+openpyxl>=3.1
+plotly>=5.22
+scipy>=1.11
+
+# Local sentiment model (no API key required)
+# torch is CPU-only here to keep the deploy image small; see README for details
+--extra-index-url https://download.pytorch.org/whl/cpu
+transformers>=4.40
+torch>=2.2
+
+# News discovery
+googlesearch-python>=1.2
+ddgs>=6.0
+google-genai
+torchvision

@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.pyc
+venv/
+.venv/
+env/
+
+# Streamlit
+.streamlit/secrets.toml
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Notebook checkpoints (and the notebook itself — see README re: hardcoded secrets)
+.ipynb_checkpoints/
+*.ipynb
+
+# Outputs
+*.xlsx
+OUTPUT/
