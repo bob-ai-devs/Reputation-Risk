@@ -45,6 +45,9 @@ GEMINI_API_KEY = st.secrets["GEMINI_API_KEY"]
 
 warnings.filterwarnings("ignore")
 
+if "colors" not in st.session_state:
+    st.session_state.colors = None
+
 # ----------------------------------------------------------------------------
 # Page config
 # ----------------------------------------------------------------------------
@@ -1290,58 +1293,64 @@ def render_compare_tab(results: dict):
     #     name: COMPARE_PALETTE[i % len(COMPARE_PALETTE)]
     #     for i, name in enumerate(company_names)
     # }
+
+    if not st.session_state.colors:
     
-    client = genai.Client(api_key=GEMINI_API_KEY)
-    
-    prompt = f"""
-    ROLE: Expert Data Visualization Architect specializing in financial dashboards.
-    
-    TASK:
-    Assign exactly one unique, highly distinct hex color code to each of the {len(company_names)} companies listed below.
-    
-    COMPANIES:
-    {", ".join(company_names)}
-    
-    CRITICAL DESIGN RULES (To ensure maximum visual variety):
-    1. SPREAD ACROSS THE SPECTRUM: Do not bundle colors in the same family. You must utilize the full range of the color wheel (e.g., blend deep blues, rich greens, vibrant oranges, dark purples, crimson reds, and deep teals). 
-    2. NO ADJACENT SHADES: If you use a blue, you cannot use another blue or cyan. Every single color must be instantly recognizable as a completely different color category.
-    3. DASHBOARD READABILITY: Colors must look sophisticated and professional (consulting/fintech style). They must have high contrast and excellent visibility against a pure white (#FFFFFF) background. Completely avoid pastels, neons, yellows, or washed-out tones.
-    
-    STRICT OUTPUT FORMATTING:
-    - Return ONLY the hex color codes. 
-    - Do NOT include any introductory text, conversational filler, markdown code blocks (no ```), or line breaks.
-    - The output must be a single, comma-separated line.
-    - Match this exact uppercase syntax: #RRGGBB
-    
-    EXAMPLE OUTPUT FORMAT (for 4 companies):
-    #1A365D,#2B6CB0,#D69E2E,#B83280
-    """
-    
-    try:
-        response = client.models.generate_content(
-            model="gemini-3.5-flash-lite",
-            contents=prompt
-        )
-    
-        color_string = response.text.strip()
-    
-        colors = re.findall(
-            r"#[0-9A-Fa-f]{6}",
-            color_string
-        )
-    
-        if len(colors) < len(company_names):
+        client = genai.Client(api_key=GEMINI_API_KEY)
+        
+        prompt = f"""
+        ROLE: Expert Data Visualization Architect specializing in financial dashboards.
+        
+        TASK:
+        Assign exactly one unique, highly distinct hex color code to each of the {len(company_names)} companies listed below.
+        
+        COMPANIES:
+        {", ".join(company_names)}
+        
+        CRITICAL DESIGN RULES (To ensure maximum visual variety):
+        1. SPREAD ACROSS THE SPECTRUM: Do not bundle colors in the same family. You must utilize the full range of the color wheel (e.g., blend deep blues, rich greens, vibrant oranges, dark purples, crimson reds, and deep teals). 
+        2. NO ADJACENT SHADES: If you use a blue, you cannot use another blue or cyan. Every single color must be instantly recognizable as a completely different color category.
+        3. DASHBOARD READABILITY: Colors must look sophisticated and professional (consulting/fintech style). They must have high contrast and excellent visibility against a pure white (#FFFFFF) background. Completely avoid pastels, neons, yellows, or washed-out tones.
+        
+        STRICT OUTPUT FORMATTING:
+        - Return ONLY the hex color codes. 
+        - Do NOT include any introductory text, conversational filler, markdown code blocks (no ```), or line breaks.
+        - The output must be a single, comma-separated line.
+        - Match this exact uppercase syntax: #RRGGBB
+        
+        EXAMPLE OUTPUT FORMAT (for 4 companies):
+        #1A365D,#2B6CB0,#D69E2E,#B83280
+        """
+        
+        try:
+            response = client.models.generate_content(
+                model="gemini-3.5-flash-lite",
+                contents=prompt
+            )
+        
+            color_string = response.text.strip()
+        
+            colors = re.findall(
+                r"#[0-9A-Fa-f]{6}",
+                color_string
+            )
+        
+            if len(colors) < len(company_names):
+                colors = (
+                    colors + COMPARE_PALETTE
+                )[:len(company_names)]
+            else:
+                colors = colors[:len(company_names)]
+        
+        except Exception:
             colors = (
-                colors + COMPARE_PALETTE
+                COMPARE_PALETTE
+                * ((len(company_names) // len(COMPARE_PALETTE)) + 1)
             )[:len(company_names)]
-        else:
-            colors = colors[:len(company_names)]
-    
-    except Exception:
-        colors = (
-            COMPARE_PALETTE
-            * ((len(company_names) // len(COMPARE_PALETTE)) + 1)
-        )[:len(company_names)]
+
+        st.session_state.colors = colors
+
+    colors = st.session_state.colors
     
     color_map = {
         name: colors[i]
@@ -1801,6 +1810,8 @@ run_clicked = st.button("🚀 Run Reputation Risk Analysis", type="primary")
 # ----------------------------------------------------------------------------
 if run_clicked:
     st.session_state.results = {}
+
+    st.session_state.colors = None
         
     vader, tokenizer, config, model = load_engines()
 
