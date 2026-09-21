@@ -1294,23 +1294,27 @@ def render_compare_tab(results: dict):
     client = genai.Client(api_key=GEMINI_API_KEY)
     
     prompt = f"""
-    Generate exactly {len(company_names)} distinct professional hex color codes,
-    one for each company below.
+    ROLE: Expert Data Visualization Architect specializing in financial dashboards.
     
-    Companies:
+    TASK:
+    Assign exactly one unique, highly distinct hex color code to each of the {len(company_names)} companies listed below.
+    
+    COMPANIES:
     {", ".join(company_names)}
     
-    Requirements:
-    - Return ONLY the hex color codes
-    - Exactly {len(company_names)} colors
-    - Comma-separated
-    - Format: #RRGGBB
-    - Colors must be visually distinct (not in same shade of color, very different than each other)
-    - Suitable for a professional financial/consulting dashboard
-    - Avoid very light colors that are difficult to see on a white background
+    CRITICAL DESIGN RULES (To ensure maximum visual variety):
+    1. SPREAD ACROSS THE SPECTRUM: Do not bundle colors in the same family. You must utilize the full range of the color wheel (e.g., blend deep blues, rich greens, vibrant oranges, dark purples, crimson reds, and deep teals). 
+    2. NO ADJACENT SHADES: If you use a blue, you cannot use another blue or cyan. Every single color must be instantly recognizable as a completely different color category.
+    3. DASHBOARD READABILITY: Colors must look sophisticated and professional (consulting/fintech style). They must have high contrast and excellent visibility against a pure white (#FFFFFF) background. Completely avoid pastels, neons, yellows, or washed-out tones.
     
-    Example:
-    #1F77B4,#FF7F0E,#2CA02C,#D62728
+    STRICT OUTPUT FORMATTING:
+    - Return ONLY the hex color codes. 
+    - Do NOT include any introductory text, conversational filler, markdown code blocks (no ```), or line breaks.
+    - The output must be a single, comma-separated line.
+    - Match this exact uppercase syntax: #RRGGBB
+    
+    EXAMPLE OUTPUT FORMAT (for 4 companies):
+    #1A365D,#2B6CB0,#D69E2E,#B83280
     """
     
     try:
