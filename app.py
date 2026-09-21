@@ -1305,7 +1305,7 @@ def render_compare_tab(results: dict):
     - Exactly {len(company_names)} colors
     - Comma-separated
     - Format: #RRGGBB
-    - Colors must be visually distinct
+    - Colors must be visually distinct (not in same shade of color, very different than each other)
     - Suitable for a professional financial/consulting dashboard
     - Avoid very light colors that are difficult to see on a white background
     
