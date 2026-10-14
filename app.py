@@ -968,6 +968,18 @@ def build_monthly_avg(df: pd.DataFrame) -> pd.DataFrame:
     return work.groupby("Year-Month")[SCORE_COLUMNS].mean().reset_index()
 
 
+def format_month_axis(fig, n_months: int):
+    """Show month-level ticks ('Jan 2026') instead of full dates on the x-axis."""
+    fig.update_xaxes(
+        type="date",
+        tickformat="%b %Y",
+        hoverformat="%b %Y",
+        dtick="M1" if n_months <= 18 else "M3",
+        tickangle=-45,
+    )
+    return fig
+
+
 def make_timeseries_chart(df: pd.DataFrame, key_suffix: str):
     """Single-company time series with a multiselect to toggle the five scores.
 
@@ -1002,6 +1014,7 @@ def make_timeseries_chart(df: pd.DataFrame, key_suffix: str):
         margin=dict(l=10, r=10, t=50, b=10),
         height=380,
     )
+    format_month_axis(fig, len(avg))
     return fig
 
 
@@ -1196,6 +1209,10 @@ def render_compare_tab(results: dict):
             margin=dict(l=10, r=10, t=50, b=10),
             height=380,
         )
+        all_months = set()
+        for _cname in selected_companies:
+            all_months.update(monthly[_cname]["Year-Month"])
+        format_month_axis(fig, len(all_months))
 
         st.plotly_chart(
             fig,
@@ -1229,13 +1246,14 @@ def build_excel_bytes(company_name: str, df: pd.DataFrame, start_date, end_date)
 
     # --- time series chart image (all five scores) ---
     avg = build_monthly_avg(df)
+    avg["Month"] = pd.to_datetime(avg["Year-Month"]).dt.strftime("%b %Y")
 
     sns.set(style="whitegrid", context="talk")
     plt.figure(figsize=(12, 8))
     for label, column in SCORE_TYPE_OPTIONS.items():
         style = SCORE_TYPE_STYLE[label]
         sns.lineplot(
-            x="Year-Month", y=column, data=avg, marker="o", label=label,
+            x="Month", y=column, data=avg, marker="o", label=label,
             linewidth=2.5, linestyle=style["mpl"], color=style["color"],
         )
     plt.title("Sentiment Score Time Series", fontsize=18, fontweight="bold")
