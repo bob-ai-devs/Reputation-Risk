@@ -2,10 +2,16 @@
 BOB Reputation Risk Analyzer — Streamlit Dashboard
 ====================================================
 A media-sentiment / reputation-risk analyzer that scrapes recent news
-coverage for one or more companies, scores it with three independent
-sentiment engines (a lexicon-based Net Percentage Score, NLTK VADER,
-and a transformer-based RoBERTa sentiment model), and renders an
-interactive dashboard with downloadable Excel reports.
+coverage for one or more companies, scores it with five independent
+sentiment engines:
+
+    1. NPS            - lexicon-based Net Percentage Score
+    2. NLPS (VADER)   - NLTK VADER compound score
+    3. RoBERTa        - cardiffnlp/twitter-roberta-base-sentiment-latest
+    4. DistilRoBERTa  - mrm8488/distilroberta-finetuned-financial-news-sentiment-analysis
+    5. FinBERT        - ProsusAI/finbert
+
+and renders an interactive dashboard with downloadable Excel reports.
 
 Converted from a Flask + ngrok / Colab notebook into a single,
 self-contained Streamlit app.
@@ -101,7 +107,7 @@ CUSTOM_CSS = f"""
         box-shadow: 0 3px 10px rgba(0,0,0,0.12);
     }}
     .kpi-label {{
-        font-size: 0.82rem;
+        font-size: 0.78rem;
         opacity: 0.9;
         text-transform: uppercase;
         letter-spacing: 0.5px;
@@ -168,11 +174,23 @@ YAHOO_HEADERS = {
 }
 
 # ----------------------------------------------------------------------------
+# Transformer model registry
+#   column name in the results dataframe -> HuggingFace model id
+# All three are 3-class (negative / neutral / positive) sentiment models.
+# The score stored is  P(positive) - P(negative)  in the range -1 .. 1.
+# ----------------------------------------------------------------------------
+MODEL_REGISTRY = {
+    "llm_sentiment": "cardiffnlp/twitter-roberta-base-sentiment-latest",
+    "distilroberta_sentiment": "mrm8488/distilroberta-finetuned-financial-news-sentiment-analysis",
+    "finbert_sentiment": "ProsusAI/finbert",
+}
+
+# ----------------------------------------------------------------------------
 # Cached resources
 # ----------------------------------------------------------------------------
 @st.cache_resource(show_spinner="Loading sentiment engines (first run only)...")
 def load_engines():
-    """Load NLTK VADER and the transformer sentiment model once per session."""
+    """Load NLTK VADER and all transformer sentiment models once per session."""
     import nltk
     from nltk.sentiment import SentimentIntensityAnalyzer
     from transformers import (
@@ -187,12 +205,15 @@ def load_engines():
 
     vader = SentimentIntensityAnalyzer()
 
-    model_name = "cardiffnlp/twitter-roberta-base-sentiment-latest"
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
-    config = AutoConfig.from_pretrained(model_name)
-    model = AutoModelForSequenceClassification.from_pretrained(model_name)
+    hf_models = {}
+    for col, model_name in MODEL_REGISTRY.items():
+        tokenizer = AutoTokenizer.from_pretrained(model_name)
+        config = AutoConfig.from_pretrained(model_name)
+        model = AutoModelForSequenceClassification.from_pretrained(model_name)
+        model.eval()
+        hf_models[col] = (tokenizer, config, model)
 
-    return vader, tokenizer, config, model
+    return vader, hf_models
 
 
 def text_preprocess(text: str) -> str:
@@ -232,7 +253,6 @@ def _build_session() -> requests.Session:
 
 
 SESSION = _build_session()
-
 
 
 # ----------------------------------------------------------------------------
@@ -279,19 +299,11 @@ def find_news_links(company_search_text: str, log=lambda m: None) -> list:
         try:
             parsed = urlparse(url)
 
-            hostname = (
-                parsed.hostname or ""
-            ).lower().rstrip(".")
-
-            path = (
-                parsed.path or ""
-            ).lower()
+            hostname = (parsed.hostname or "").lower().rstrip(".")
+            path = (parsed.path or "").lower()
 
             # Only genuine Moneycontrol domain
-            if hostname not in {
-                "www.moneycontrol.com",
-                "moneycontrol.com",
-            }:
+            if hostname not in {"www.moneycontrol.com", "moneycontrol.com"}:
                 return False
 
             # Only news tag pages
@@ -319,20 +331,14 @@ def find_news_links(company_search_text: str, log=lambda m: None) -> list:
             return None
 
         try:
-
-            url = unquote(
-                url.strip()
-            )
+            url = unquote(url.strip())
 
             if not is_moneycontrol_tag_url(url):
                 return None
 
             parsed = urlparse(url)
 
-            clean_url = (
-                "https://www.moneycontrol.com"
-                + parsed.path
-            )
+            clean_url = "https://www.moneycontrol.com" + parsed.path
 
             if is_moneycontrol_tag_url(clean_url):
                 return clean_url
@@ -350,10 +356,7 @@ def find_news_links(company_search_text: str, log=lambda m: None) -> list:
 
         clean_url = normalize_moneycontrol_url(url)
 
-        if (
-            clean_url
-            and clean_url not in links
-        ):
+        if clean_url and clean_url not in links:
             links.append(clean_url)
             return True
 
@@ -364,46 +367,26 @@ def find_news_links(company_search_text: str, log=lambda m: None) -> list:
     # ========================================================================
 
     try:
-
-        log(
-            "Searching Google for Moneycontrol news links..."
-        )
+        log("Searching Google for Moneycontrol news links...")
 
         url = (
             "https://www.google.com/search?q="
             + quote_plus(
-                f'site:moneycontrol.com/news/tags/ '
-                f'"{company_search_text}"'
+                f'site:moneycontrol.com/news/tags/ "{company_search_text}"'
             )
         )
 
-        source = SESSION.get(
-            url,
-            headers=HEADERS,
-            timeout=15
-        )
-
+        source = SESSION.get(url, headers=HEADERS, timeout=15)
         source.raise_for_status()
 
-        soup = BeautifulSoup(
-            source.text,
-            "html.parser"
-        )
+        soup = BeautifulSoup(source.text, "html.parser")
 
-        for a in soup.find_all(
-            "a",
-            href=True
-        ):
-
+        for a in soup.find_all("a", href=True):
             href = a["href"].strip()
-
             add_link(href)
 
     except Exception as e:
-
-        log(
-            f"Google scrape failed: {e}"
-        )
+        log(f"Google scrape failed: {e}")
 
     # ========================================================================
     # TIER 2: GOOGLESEARCH
@@ -412,36 +395,25 @@ def find_news_links(company_search_text: str, log=lambda m: None) -> list:
     if not links:
 
         try:
-
-            log(
-                "Trying secondary search path (googlesearch)..."
-            )
+            log("Trying secondary search path (googlesearch)...")
 
             from googlesearch import search as g_search
 
             wrong_count = 0
 
             for link in g_search(
-                f"{company_search_text} moneycontrol "
-                f"latest and breaking news"
+                f"{company_search_text} moneycontrol latest and breaking news"
             ):
-
                 if add_link(link):
-
                     wrong_count = 0
-
                 else:
-
                     wrong_count += 1
 
                 if wrong_count >= 10:
                     break
 
         except Exception as e:
-
-            log(
-                f"googlesearch fallback failed: {e}"
-            )
+            log(f"googlesearch fallback failed: {e}")
 
     # ========================================================================
     # TIER 3: DUCKDUCKGO - DDGS
@@ -450,39 +422,26 @@ def find_news_links(company_search_text: str, log=lambda m: None) -> list:
     if not links:
 
         try:
-
-            log(
-                "Trying tertiary search path "
-                "(DuckDuckGo via ddgs)..."
-            )
+            log("Trying tertiary search path (DuckDuckGo via ddgs)...")
 
             from ddgs import DDGS
 
             with DDGS() as ddgs:
 
                 results = ddgs.text(
-                    f"{company_search_text} "
-                    f"latest news Moneycontrol",
+                    f"{company_search_text} latest news Moneycontrol",
                     max_results=30
                 )
 
                 for res in results:
-
-                    href = res.get(
-                        "href",
-                        ""
-                    )
+                    href = res.get("href", "")
 
                     if add_link(href):
-
                         if len(links) >= 3:
                             break
 
         except Exception as e:
-
-            log(
-                f"DuckDuckGo (ddgs) fallback failed: {e}"
-            )
+            log(f"DuckDuckGo (ddgs) fallback failed: {e}")
 
     # ========================================================================
     # TIER 4: BING
@@ -491,65 +450,36 @@ def find_news_links(company_search_text: str, log=lambda m: None) -> list:
     if not links:
 
         try:
-
-            log(
-                "Trying Bing search scrape..."
-            )
+            log("Trying Bing search scrape...")
 
             url = (
                 "https://www.bing.com/search?q="
                 + quote_plus(
-                    f'site:moneycontrol.com/news/tags/ '
-                    f'"{company_search_text}"'
+                    f'site:moneycontrol.com/news/tags/ "{company_search_text}"'
                 )
             )
 
-            source = SESSION.get(
-                url,
-                headers=HEADERS,
-                timeout=15
-            )
-
+            source = SESSION.get(url, headers=HEADERS, timeout=15)
             source.raise_for_status()
 
-            soup = BeautifulSoup(
-                source.text,
-                "html.parser"
-            )
+            soup = BeautifulSoup(source.text, "html.parser")
 
-            for a in soup.find_all(
-                "a",
-                href=True
-            ):
+            for a in soup.find_all("a", href=True):
 
                 href = a["href"].strip()
 
-                # ------------------------------------------------------------
                 # Direct Moneycontrol URL
-                # ------------------------------------------------------------
-
                 if add_link(href):
                     continue
 
-                # ------------------------------------------------------------
                 # Bing redirect URL
-                # ------------------------------------------------------------
-
                 if "bing.com/ck/a" not in href.lower():
                     continue
 
                 try:
-
                     parsed = urlparse(href)
-
-                    params = parse_qs(
-                        parsed.query
-                    )
-
-                    encoded_url = params.get(
-                        "u",
-                        [None]
-                    )[0]
+                    params = parse_qs(parsed.query)
+                    encoded_url = params.get("u", [None])[0]
 
                     if not encoded_url:
                         continue
@@ -561,67 +491,35 @@ def find_news_links(company_search_text: str, log=lambda m: None) -> list:
                         encoded_url = encoded_url[2:]
 
                     # Base64 padding
-                    encoded_url += "=" * (
-                        (-len(encoded_url)) % 4
-                    )
+                    encoded_url += "=" * ((-len(encoded_url)) % 4)
 
                     try:
-
                         decoded_url = (
-                            base64.urlsafe_b64decode(
-                                encoded_url
-                            )
-                            .decode(
-                                "utf-8",
-                                errors="ignore"
-                            )
+                            base64.urlsafe_b64decode(encoded_url)
+                            .decode("utf-8", errors="ignore")
                             .strip()
                         )
-
                     except Exception:
-
                         # Ignore unrelated Bing tracking URLs.
                         continue
 
-                    decoded_url = unquote(
-                        decoded_url
-                    ).strip()
+                    decoded_url = unquote(decoded_url).strip()
 
-                    # IMPORTANT:
-                    #
-                    # add_link() parses hostname/path.
-                    #
-                    # Therefore a URL such as:
-                    #
-                    # https://www.bing.com/copilotsearch?
-                    # q=site:moneycontrol.com/news/tags/
-                    #
+                    # add_link() parses hostname/path, so a URL such as
+                    # https://www.bing.com/copilotsearch?q=site:moneycontrol.com/news/tags/
                     # will NOT pass validation.
-
-                    add_link(
-                        decoded_url
-                    )
+                    add_link(decoded_url)
 
                 except Exception:
-
                     continue
 
-            log(
-                f"Bing found {len(links)} "
-                f"valid Moneycontrol tag URL(s)"
-            )
+            log(f"Bing found {len(links)} valid Moneycontrol tag URL(s)")
 
             for link in links:
-
-                log(
-                    f"  -> {link}"
-                )
+                log(f"  -> {link}")
 
         except Exception as e:
-
-            log(
-                f"Bing scrape failed: {e}"
-            )
+            log(f"Bing scrape failed: {e}")
 
     # ========================================================================
     # TIER 5: YAHOO
@@ -630,70 +528,42 @@ def find_news_links(company_search_text: str, log=lambda m: None) -> list:
     if not links:
 
         try:
-
-            log(
-                "Trying Yahoo search scrape..."
-            )
+            log("Trying Yahoo search scrape...")
 
             # Warm up Yahoo session
             try:
-
                 SESSION.get(
                     "https://search.yahoo.com/",
                     headers=YAHOO_HEADERS,
                     timeout=10
                 )
-
             except Exception:
                 pass
 
-            url = (
-                "https://search.yahoo.com/search?p="
-                + quote_plus(query_text)
-            )
+            url = "https://search.yahoo.com/search?p=" + quote_plus(query_text)
 
-            source = SESSION.get(
-                url,
-                headers=YAHOO_HEADERS,
-                timeout=15
-            )
-
+            source = SESSION.get(url, headers=YAHOO_HEADERS, timeout=15)
             source.raise_for_status()
 
-            soup = BeautifulSoup(
-                source.text,
-                "html.parser"
-            )
+            soup = BeautifulSoup(source.text, "html.parser")
 
-            for a in soup.find_all(
-                "a",
-                href=True
-            ):
+            for a in soup.find_all("a", href=True):
 
                 href = a["href"].strip()
 
                 # Yahoo redirect format
                 if "RU=" in href:
-
                     try:
-
                         href = unquote(
-                            href
-                            .split("RU=", 1)[1]
-                            .split("/RK=", 1)[0]
+                            href.split("RU=", 1)[1].split("/RK=", 1)[0]
                         )
-
                     except Exception:
-
                         continue
 
                 add_link(href)
 
         except Exception as e:
-
-            log(
-                f"Yahoo scrape failed: {e}"
-            )
+            log(f"Yahoo scrape failed: {e}")
 
     # ========================================================================
     # TIER 6: DUCKDUCKGO HTML
@@ -702,47 +572,29 @@ def find_news_links(company_search_text: str, log=lambda m: None) -> list:
     if not links:
 
         try:
-
-            log(
-                "Trying DuckDuckGo HTML-lite scrape..."
-            )
+            log("Trying DuckDuckGo HTML-lite scrape...")
 
             resp = SESSION.post(
                 "https://html.duckduckgo.com/html/",
-                data={
-                    "q": (
-                        f"{company_search_text} "
-                        f"moneycontrol latest news"
-                    )
-                },
+                data={"q": f"{company_search_text} moneycontrol latest news"},
                 headers=HEADERS,
                 timeout=15
             )
 
             resp.raise_for_status()
 
-            soup = BeautifulSoup(
-                resp.text,
-                "html.parser"
-            )
+            soup = BeautifulSoup(resp.text, "html.parser")
 
-            for a in soup.find_all(
-                "a",
-                href=True
-            ):
+            for a in soup.find_all("a", href=True):
 
                 href = a["href"].strip()
 
                 if add_link(href):
-
                     if len(links) >= 3:
                         break
 
         except Exception as e:
-
-            log(
-                f"DuckDuckGo HTML-lite scrape failed: {e}"
-            )
+            log(f"DuckDuckGo HTML-lite scrape failed: {e}")
 
     # ========================================================================
     # TIER 7: GEMINI
@@ -755,28 +607,12 @@ def find_news_links(company_search_text: str, log=lambda m: None) -> list:
     if not links:
 
         try:
-
-            log(
-                "Trying Gemini Moneycontrol link finder..."
-            )
+            log("Trying Gemini Moneycontrol link finder...")
 
             from google import genai
 
-            # ================================================================
-            # BACKEND API KEY
-            #
-            # Keep your API key in your backend.
-            #
-            # Expected existing variable:
-            #
-            # GEMINI_API_KEY
-            #
-            # No frontend input is required.
-            # ================================================================
-
-            gemini_client = genai.Client(
-                api_key=GEMINI_API_KEY
-            )
+            # Backend API key (GEMINI_API_KEY from st.secrets); no frontend input.
+            gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 
             prompt = f"""
 Find the official Moneycontrol news TAG page for this company.
@@ -821,51 +657,26 @@ return each URL on a separate line.
                 contents=prompt
             )
 
-            gemini_text = (
-                getattr(
-                    response,
-                    "text",
-                    ""
-                )
-                or ""
-            ).strip()
+            gemini_text = (getattr(response, "text", "") or "").strip()
 
             if gemini_text:
 
-                candidates = re.findall(
-                    r'https?://[^\s<>"\']+',
-                    gemini_text
-                )
+                candidates = re.findall(r'https?://[^\s<>"\']+', gemini_text)
 
                 for candidate in candidates:
 
-                    candidate = candidate.rstrip(
-                        ".,;:)]}>\"'"
-                    )
+                    candidate = candidate.rstrip(".,;:)]}>\"'")
 
                     if add_link(candidate):
+                        log(f"Gemini found Moneycontrol URL: {candidate}")
 
-                        log(
-                            "Gemini found Moneycontrol URL: "
-                            f"{candidate}"
-                        )
-
-            log(
-                f"Gemini found {len(links)} "
-                f"valid Moneycontrol tag URL(s)"
-            )
+            log(f"Gemini found {len(links)} valid Moneycontrol tag URL(s)")
 
             for link in links:
-
-                log(
-                    f"  -> {link}"
-                )
+                log(f"  -> {link}")
 
         except Exception as e:
-
-            log(
-                f"Gemini link finder failed: {e}"
-            )
+            log(f"Gemini link finder failed: {e}")
 
     # ========================================================================
     # TIER 8: DIRECT MONEYCONTROL URL CONSTRUCTION
@@ -876,48 +687,26 @@ return each URL on a separate line.
     if not links:
 
         try:
+            log("Trying direct Moneycontrol tag URL construction...")
 
-            log(
-                "Trying direct Moneycontrol tag URL construction..."
-            )
-
-            base = (
-                company_search_text
-                .lower()
-                .strip()
-            )
+            base = company_search_text.lower().strip()
 
             slug_variants = [
-                re.sub(
-                    r"[^a-z0-9]+",
-                    "-",
-                    base
-                ).strip("-"),
-
-                re.sub(
-                    r"[^a-z0-9]+",
-                    "",
-                    base
-                )
+                re.sub(r"[^a-z0-9]+", "-", base).strip("-"),
+                re.sub(r"[^a-z0-9]+", "", base),
             ]
 
             slug_variants = list(
-                dict.fromkeys(
-                    slug
-                    for slug in slug_variants
-                    if slug
-                )
+                dict.fromkeys(slug for slug in slug_variants if slug)
             )
 
             for slug in slug_variants:
 
                 candidate_url = (
-                    "https://www.moneycontrol.com"
-                    f"/news/tags/{slug}.html"
+                    f"https://www.moneycontrol.com/news/tags/{slug}.html"
                 )
 
                 try:
-
                     response = SESSION.get(
                         candidate_url,
                         headers=HEADERS,
@@ -932,28 +721,16 @@ return each URL on a separate line.
                     final_url = response.url
 
                     if add_link(final_url):
-
-                        log(
-                            "Direct fallback found: "
-                            f"{final_url}"
-                        )
+                        log(f"Direct fallback found: {final_url}")
 
                     elif add_link(candidate_url):
-
-                        log(
-                            "Direct fallback found: "
-                            f"{candidate_url}"
-                        )
+                        log(f"Direct fallback found: {candidate_url}")
 
                 except Exception:
-
                     continue
 
         except Exception as e:
-
-            log(
-                f"Direct URL construction failed: {e}"
-            )
+            log(f"Direct URL construction failed: {e}")
 
     # ========================================================================
     # FINAL SAFETY VALIDATION
@@ -962,38 +739,20 @@ return each URL on a separate line.
     valid_links = []
 
     for link in links:
+        clean_url = normalize_moneycontrol_url(link)
 
-        clean_url = normalize_moneycontrol_url(
-            link
-        )
-
-        if (
-            clean_url
-            and clean_url not in valid_links
-        ):
-            valid_links.append(
-                clean_url
-            )
+        if clean_url and clean_url not in valid_links:
+            valid_links.append(clean_url)
 
     links = valid_links
 
-    # ========================================================================
-    # FINAL LOG
-    # ========================================================================
-
-    log(
-        f"Final valid Moneycontrol source pages: "
-        f"{len(links)}"
-    )
+    log(f"Final valid Moneycontrol source pages: {len(links)}")
 
     for link in links:
-
-        log(
-            f"  -> {link}"
-        )
+        log(f"  -> {link}")
 
     return links
-    
+
 
 def fetch_articles(links: list, start_date: datetime, end_date: datetime, log=lambda m: None) -> pd.DataFrame:
     articles = []
@@ -1069,7 +828,8 @@ def fetch_articles(links: list, start_date: datetime, end_date: datetime, log=la
 # ----------------------------------------------------------------------------
 # Sentiment scoring
 # ----------------------------------------------------------------------------
-def score_sentiment(df_articles: pd.DataFrame, custom_words: dict, vader, tokenizer, config, model) -> pd.DataFrame:
+def score_sentiment(df_articles: pd.DataFrame, custom_words: dict, vader, hf_models: dict) -> pd.DataFrame:
+    """Score every article with NPS, VADER and all transformer models in MODEL_REGISTRY."""
     lexicon = vader.lexicon
     base_custom = {
         "default": -4, "defaulted": -4, "defaults": -4, "defaulting": -4,
@@ -1113,41 +873,52 @@ def score_sentiment(df_articles: pd.DataFrame, custom_words: dict, vader, tokeni
     df["NPS"] = ((df["positive_words_list"].str.len() - df["negative_words_list"].str.len()) / denom).round(2)
     df["NPS"] = df["NPS"].fillna(0)
 
-    llm_sentiment = []
+    # ------------------------------------------------------------------
+    # Transformer models: RoBERTa, DistilRoBERTa (financial), FinBERT
+    # ------------------------------------------------------------------
     import torch
-    
+
+    def _signed_score(text, tokenizer, config, model):
+        """P(positive) - P(negative) for a 3-class pos/neu/neg model."""
+        encoded = tokenizer(text, return_tensors="pt", truncation=True, max_length=512)
+        with torch.no_grad():
+            logits = model(**encoded).logits[0]
+        probs = torch.softmax(logits, dim=-1).numpy()
+        curr_pos, curr_neg = 0.0, 0.0
+        for idx, p in enumerate(probs):
+            label = config.id2label[idx].lower()
+            if "pos" in label:
+                curr_pos = float(p)
+            elif "neg" in label:
+                curr_neg = float(p)
+        return curr_pos - curr_neg
+
+    scores_by_col = {col: [] for col in hf_models}
+
     progress = st.progress(0, text="Starting sentiment scoring...")
-    
+
     for i in range(len(df)):
         progress.progress(
             (i + 1) / len(df),
-            text=f"Scoring sentiment: {i + 1} out of {len(df)}"
+            text=f"Scoring sentiment: {i + 1} out of {len(df)} (3 transformer models)"
         )
         news = f"{df.loc[i, 'article_title']} - {df.loc[i, 'article_summary']}"
-        text = text_preprocess(news)
-        encoded = tokenizer(text, return_tensors="pt", truncation=True, max_length=512)
-        with torch.no_grad():
-            output = model(**encoded)
-        scores = output[0][0].detach().numpy()
-        scores = np.exp(scores) / np.sum(np.exp(scores))
-        ranking = np.argsort(scores)[::-1]
-        curr_pos, curr_neg = 0.0, 0.0
-        for r in ranking:
-            label = config.id2label[r].lower()
-            if "pos" in label:
-                curr_pos = scores[r]
-            elif "neg" in label:
-                curr_neg = scores[r]
-        llm_sentiment.append(float(curr_pos - curr_neg))
+        for col, (tokenizer, config, model) in hf_models.items():
+            # The twitter-RoBERTa model was trained with @user / http normalisation.
+            text = text_preprocess(news) if col == "llm_sentiment" else news
+            scores_by_col[col].append(_signed_score(text, tokenizer, config, model))
 
     progress.empty()
 
-    df["llm_sentiment"] = llm_sentiment
+    for col, values in scores_by_col.items():
+        df[col] = values
+
     df["article_date"] = pd.to_datetime(df["article_date"]).dt.date
     df = df.sort_values(by="article_date", ascending=False).reset_index(drop=True)
 
     cols = ["article_date", "article_title", "article_summary", "article_url",
-            "NPS", "compound", "llm_sentiment", "positive_words_list", "negative_words_list"]
+            "NPS", "compound", *MODEL_REGISTRY.keys(),
+            "positive_words_list", "negative_words_list"]
     return df[cols]
 
 
@@ -1161,18 +932,24 @@ def risk_bucket(value: float) -> str:
 
 BUCKET_COLOR = {"green": BOB_GREEN, "amber": BOB_AMBER, "red": BOB_RED}
 
-# Shared score-type definitions (column name + display style), used by both the
-# per-company time series chart and the cross-company Compare tab.
+# Shared score-type definitions (column name + display style), used by the
+# per-company time series chart, the Compare tab, KPI cards and Excel export.
 SCORE_TYPE_OPTIONS = {
     "NPS": "NPS",
     "NLPS (VADER)": "compound",
     "LLM (RoBERTa)": "llm_sentiment",
+    "DistilRoBERTa (Financial)": "distilroberta_sentiment",
+    "FinBERT (Financial)": "finbert_sentiment",
 }
 SCORE_TYPE_STYLE = {
-    "NPS": {"color": BOB_MAROON, "dash": "solid"},
-    "NLPS (VADER)": {"color": BOB_ORANGE, "dash": "dash"},
-    "LLM (RoBERTa)": {"color": BOB_RED, "dash": "dot"},
+    "NPS":                       {"color": BOB_MAROON, "dash": "solid",    "mpl": "-"},
+    "NLPS (VADER)":              {"color": BOB_ORANGE, "dash": "dash",     "mpl": "-."},
+    "LLM (RoBERTa)":             {"color": BOB_RED,    "dash": "dot",      "mpl": "--"},
+    "DistilRoBERTa (Financial)": {"color": "#2E86AB",  "dash": "dashdot",  "mpl": ":"},
+    "FinBERT (Financial)":       {"color": "#16A085",  "dash": "longdash", "mpl": (0, (5, 2))},
 }
+SCORE_COLUMNS = list(SCORE_TYPE_OPTIONS.values())
+
 # Distinct per-company palette for the Compare tab (BOB colors first, then extras)
 COMPARE_PALETTE = [
     BOB_MAROON, BOB_ORANGE, BOB_RED, "#2E86AB", "#5CB85C",
@@ -1184,15 +961,15 @@ COMPARE_PALETTE = [
 # Charts (Plotly, for the on-screen interactive dashboard)
 # ----------------------------------------------------------------------------
 def build_monthly_avg(df: pd.DataFrame) -> pd.DataFrame:
-    """Month-wise average of NPS / compound (NLPS) / llm_sentiment for one company."""
+    """Month-wise average of all five scores for one company."""
     work = df.copy()
     work["article_date"] = pd.to_datetime(work["article_date"])
     work["Year-Month"] = work["article_date"].dt.to_period("M").astype(str)
-    return work.groupby("Year-Month")[["NPS", "compound", "llm_sentiment"]].mean().reset_index()
+    return work.groupby("Year-Month")[SCORE_COLUMNS].mean().reset_index()
 
 
 def make_timeseries_chart(df: pd.DataFrame, key_suffix: str):
-    """Single-company time series with a multiselect to toggle NPS / NLPS / LLM.
+    """Single-company time series with a multiselect to toggle the five scores.
 
     `key_suffix` must be unique per call site (e.g. derived from the company
     name/tab index) — Streamlit raises a duplicate-element error otherwise
@@ -1289,59 +1066,49 @@ def render_compare_tab(results: dict):
 
     company_names = list(results.keys())
 
-    # color_map = {
-    #     name: COMPARE_PALETTE[i % len(COMPARE_PALETTE)]
-    #     for i, name in enumerate(company_names)
-    # }
-
     if not st.session_state.colors:
-    
+
         client = genai.Client(api_key=GEMINI_API_KEY)
-        
+
         prompt = f"""
         ROLE: Expert Data Visualization Architect specializing in financial dashboards.
-        
+
         TASK:
         Assign exactly one unique, highly distinct hex color code to each of the {len(company_names)} companies listed below.
-        
+
         COMPANIES:
         {", ".join(company_names)}
-        
+
         CRITICAL DESIGN RULES (To ensure maximum visual variety):
-        1. SPREAD ACROSS THE SPECTRUM: Do not bundle colors in the same family. You must utilize the full range of the color wheel (e.g., blend deep blues, rich greens, vibrant oranges, dark purples, crimson reds, and deep teals). 
+        1. SPREAD ACROSS THE SPECTRUM: Do not bundle colors in the same family. You must utilize the full range of the color wheel (e.g., blend deep blues, rich greens, vibrant oranges, dark purples, crimson reds, and deep teals).
         2. NO ADJACENT SHADES: If you use a blue, you cannot use another blue or cyan. Every single color must be instantly recognizable as a completely different color category.
         3. DASHBOARD READABILITY: Colors must look sophisticated and professional (consulting/fintech style). They must have high contrast and excellent visibility against a pure white (#FFFFFF) background. Completely avoid pastels, neons, yellows, or washed-out tones.
-        
+
         STRICT OUTPUT FORMATTING:
-        - Return ONLY the hex color codes. 
+        - Return ONLY the hex color codes.
         - Do NOT include any introductory text, conversational filler, markdown code blocks (no ```), or line breaks.
         - The output must be a single, comma-separated line.
         - Match this exact uppercase syntax: #RRGGBB
-        
+
         EXAMPLE OUTPUT FORMAT (for 4 companies):
         #1A365D,#2B6CB0,#D69E2E,#B83280
         """
-        
+
         try:
             response = client.models.generate_content(
                 model="gemini-3.5-flash-lite",
                 contents=prompt
             )
-        
+
             color_string = response.text.strip()
-        
-            colors = re.findall(
-                r"#[0-9A-Fa-f]{6}",
-                color_string
-            )
-        
+
+            colors = re.findall(r"#[0-9A-Fa-f]{6}", color_string)
+
             if len(colors) < len(company_names):
-                colors = (
-                    colors + COMPARE_PALETTE
-                )[:len(company_names)]
+                colors = (colors + COMPARE_PALETTE)[:len(company_names)]
             else:
                 colors = colors[:len(company_names)]
-        
+
         except Exception:
             colors = (
                 COMPARE_PALETTE
@@ -1351,11 +1118,8 @@ def render_compare_tab(results: dict):
         st.session_state.colors = colors
 
     colors = st.session_state.colors
-    
-    color_map = {
-        name: colors[i]
-        for i, name in enumerate(company_names)
-    }
+
+    color_map = {name: colors[i] for i, name in enumerate(company_names)}
 
     c1, c2 = st.columns(2)
 
@@ -1397,11 +1161,8 @@ def render_compare_tab(results: dict):
 
             avg = monthly[cname]
 
-            # --------------------------------------------------
-            # Calculate average from original dataframe
-            # Ignore only blank / NaN values
-            # Keep zero values
-            # --------------------------------------------------
+            # Average from the original dataframe; ignore only blank / NaN
+            # values and keep zero values.
             score_value = "N/A"
 
             if column in results[cname]["df"].columns:
@@ -1411,15 +1172,11 @@ def render_compare_tab(results: dict):
                     errors="coerce"
                 )
 
-                # mean() ignores NaN automatically
-                # Zero values are NOT removed
                 if score_series.notna().any():
                     line_avg = score_series.mean()
                     score_value = f"{line_avg:.2f}"
 
-            # --------------------------------------------------
             # Company + average score in legend
-            # --------------------------------------------------
             legend_name = f"{cname} [Avg: {score_value}]"
 
             fig.add_trace(
@@ -1428,10 +1185,7 @@ def render_compare_tab(results: dict):
                     y=avg[column],
                     mode="lines+markers",
                     name=legend_name,
-                    line=dict(
-                        color=color_map[cname],
-                        width=3
-                    ),
+                    line=dict(color=color_map[cname], width=3),
                 )
             )
 
@@ -1439,12 +1193,7 @@ def render_compare_tab(results: dict):
             title=f"{label} — Monthwise Comparison",
             template="plotly_white",
             legend_title_text="Company",
-            margin=dict(
-                l=10,
-                r=10,
-                t=50,
-                b=10
-            ),
+            margin=dict(l=10, r=10, t=50, b=10),
             height=380,
         )
 
@@ -1453,7 +1202,6 @@ def render_compare_tab(results: dict):
             width="stretch",
             key=f"compare_chart_{safe_key(label)}"
         )
-
 
 
 # ----------------------------------------------------------------------------
@@ -1478,20 +1226,18 @@ def build_excel_bytes(company_name: str, df: pd.DataFrame, start_date, end_date)
     wb = load_workbook(buf)
 
     news_size = len(df)
-    avg_nps = df["NPS"].mean()
-    avg_nlps = df["compound"].mean()
-    avg_llm = df["llm_sentiment"].mean()
 
-    # --- time series chart image ---
+    # --- time series chart image (all five scores) ---
     avg = build_monthly_avg(df)
 
     sns.set(style="whitegrid", context="talk")
     plt.figure(figsize=(12, 8))
-    sns.lineplot(x="Year-Month", y="NPS", data=avg, marker="o", label="NPS", linewidth=2.5, color=BOB_MAROON)
-    sns.lineplot(x="Year-Month", y="compound", data=avg, marker="o", label="NLPS", linewidth=2.5,
-                 linestyle="-.", color=BOB_ORANGE)
-    sns.lineplot(x="Year-Month", y="llm_sentiment", data=avg, marker="o", label="LLM", linewidth=2.5,
-                 linestyle="--", color=BOB_RED)
+    for label, column in SCORE_TYPE_OPTIONS.items():
+        style = SCORE_TYPE_STYLE[label]
+        sns.lineplot(
+            x="Year-Month", y=column, data=avg, marker="o", label=label,
+            linewidth=2.5, linestyle=style["mpl"], color=style["color"],
+        )
     plt.title("Sentiment Score Time Series", fontsize=18, fontweight="bold")
     plt.xticks(rotation=45, fontsize=10)
     plt.tight_layout()
@@ -1503,88 +1249,58 @@ def build_excel_bytes(company_name: str, df: pd.DataFrame, start_date, end_date)
     # --- bubble chart image ---
     bubble_buf = None
     bubble_fig = make_word_bubble_chart(df)
-    
+
     if bubble_fig is not None:
         translator = str.maketrans("", "", string.punctuation)
         all_words = []
-    
+
         for col in ["positive_words_list", "negative_words_list"]:
             for entry in df[col]:
                 words = entry if isinstance(entry, list) else ast.literal_eval(str(entry))
-    
+
                 for w in words:
                     cleaned = w.lower().translate(translator)
-    
+
                     if cleaned:
                         all_words.append(cleaned)
-    
-        # ------------------------------------------------------------
+
         # Calculate word frequency and sentiment intensity
-        # ------------------------------------------------------------
         freq = {}
-    
+
         from nltk.sentiment import SentimentIntensityAnalyzer
         analyzer = SentimentIntensityAnalyzer()
-    
+
         for w in all_words:
             if w not in freq:
-                freq[w] = [
-                    0,
-                    analyzer.polarity_scores(w)["compound"]
-                ]
-    
+                freq[w] = [0, analyzer.polarity_scores(w)["compound"]]
+
             freq[w][0] += 1
-    
-        # ------------------------------------------------------------
-        # Create dataframe
-        # ------------------------------------------------------------
+
         wdf = pd.DataFrame({
             "Keys": list(freq.keys()),
             "Count": [v[0] for v in freq.values()],
             "Intensity": [v[1] for v in freq.values()]
         })
-    
-        wdf["sentiment"] = np.where(
-            wdf["Intensity"] > 0,
-            "positive",
-            "negative"
-        )
-    
-        # ------------------------------------------------------------
+
+        wdf["sentiment"] = np.where(wdf["Intensity"] > 0, "positive", "negative")
+
         # Top positive / negative words
-        # ------------------------------------------------------------
-        top_pos = (
-            wdf[wdf["sentiment"] == "positive"]
-            .nlargest(15, "Count")
-        )
-    
-        top_neg = (
-            wdf[wdf["sentiment"] == "negative"]
-            .nlargest(15, "Count")
-        )
-    
-        plot_df = pd.concat(
-            [top_neg, top_pos],
-            ignore_index=True
-        )
-    
-        # ------------------------------------------------------------
-        # Plot
-        # ------------------------------------------------------------
+        top_pos = wdf[wdf["sentiment"] == "positive"].nlargest(15, "Count")
+        top_neg = wdf[wdf["sentiment"] == "negative"].nlargest(15, "Count")
+
+        plot_df = pd.concat([top_neg, top_pos], ignore_index=True)
+
         if not plot_df.empty:
-    
+
             fig, ax = plt.subplots(figsize=(14, 8))
-    
+
             sns.scatterplot(
                 data=plot_df,
                 x="Intensity",
                 y="Count",
                 size="Count",
                 hue="sentiment",
-                palette={
-                    "positive": BOB_GREEN,
-                    "negative": BOB_RED
-                },
+                palette={"positive": BOB_GREEN, "negative": BOB_RED},
                 sizes=(20, 2000),
                 alpha=0.6,
                 edgecolor="w",
@@ -1592,10 +1308,8 @@ def build_excel_bytes(company_name: str, df: pd.DataFrame, start_date, end_date)
                 legend=False,          # IMPORTANT: no seaborn legend
                 ax=ax
             )
-    
-            # --------------------------------------------------------
+
             # Add word labels
-            # --------------------------------------------------------
             for _, row in plot_df.iterrows():
                 ax.text(
                     row["Intensity"],
@@ -1606,92 +1320,58 @@ def build_excel_bytes(company_name: str, df: pd.DataFrame, start_date, end_date)
                     va="center",
                     rotation=25
                 )
-    
-            # --------------------------------------------------------
+
             # Remove ANY automatically generated legend
-            # --------------------------------------------------------
             existing_legend = ax.get_legend()
-    
+
             if existing_legend is not None:
                 existing_legend.remove()
-    
-            # --------------------------------------------------------
+
             # Create ONLY Positive / Negative legend
-            # --------------------------------------------------------
             from matplotlib.lines import Line2D
-    
+
             positive_handle = Line2D(
-                [0],
-                [0],
-                marker="o",
-                linestyle="None",
-                markerfacecolor=BOB_GREEN,
-                markeredgecolor="white",
-                markersize=9,
-                label="Positive"
+                [0], [0], marker="o", linestyle="None",
+                markerfacecolor=BOB_GREEN, markeredgecolor="white",
+                markersize=9, label="Positive"
             )
-    
+
             negative_handle = Line2D(
-                [0],
-                [0],
-                marker="o",
-                linestyle="None",
-                markerfacecolor=BOB_RED,
-                markeredgecolor="white",
-                markersize=9,
-                label="Negative"
+                [0], [0], marker="o", linestyle="None",
+                markerfacecolor=BOB_RED, markeredgecolor="white",
+                markersize=9, label="Negative"
             )
-    
+
             ax.legend(
-                handles=[
-                    positive_handle,
-                    negative_handle
-                ],
-                labels=[
-                    "Positive",
-                    "Negative"
-                ],
+                handles=[positive_handle, negative_handle],
+                labels=["Positive", "Negative"],
                 title="Sentiment",
                 loc="best",
                 frameon=True
             )
-    
-            # --------------------------------------------------------
-            # Title
-            # --------------------------------------------------------
-            ax.set_title(
-                "Bubble Plot of Sentiment Analysis",
-                fontsize=14
-            )
-    
+
+            ax.set_title("Bubble Plot of Sentiment Analysis", fontsize=14)
+
             plt.tight_layout()
-    
-            # --------------------------------------------------------
-            # Save image
-            # --------------------------------------------------------
+
             bubble_buf = io.BytesIO()
-    
-            fig.savefig(
-                bubble_buf,
-                format="png",
-                dpi=100,
-                bbox_inches="tight"
-            )
-    
+
+            fig.savefig(bubble_buf, format="png", dpi=100, bbox_inches="tight")
+
             plt.close(fig)
-    
+
             bubble_buf.seek(0)
-    
+
     # --- Dashboard sheet ---
     ws = wb.create_sheet("Dashboard")
-    for row in ws.iter_rows(min_row=1, max_row=20, max_col=17):
+    for row in ws.iter_rows(min_row=1, max_row=26, max_col=17):
         for cell in row:
             ws.row_dimensions[cell.row].height = 28
     for col_letter in [chr(c) for c in range(ord("A"), ord("Q") + 1)]:
         ws.column_dimensions[col_letter].width = 22
 
     border = Border(*[Side(border_style="thin", color="000000")] * 4)
-    for r in range(3, 16):
+    for r in range(3, 22):
         for c in range(1, 18):
             ws.cell(row=r, column=c).border = border
 
@@ -1707,31 +1387,41 @@ def build_excel_bytes(company_name: str, df: pd.DataFrame, start_date, end_date)
     ws["F4"] = news_size
     ws["F4"].font = Font(color="F7931E", bold=True, size=16)
 
-    labels = [("A7", "1-", "B7", "NPS", "F8", avg_nps, "C7",
-               "Net percentage score (-1 to 1) = (Positive words - Negative words) / Total sentiment words"),
-              ("A10", "2-", "B10", "NLPS", "F11", avg_nlps, "C10",
-               "NLTK VADER compound sentiment score, ranges -1 to 1"),
-              ("A13", "3-", "B13", "LLM", "F14", avg_llm, "C13",
-               "Transformer (RoBERTa) sentiment score, ranges -1 to 1")]
+    score_rows = [
+        ("NPS", "NPS",
+         "Net percentage score (-1 to 1) = (Positive words - Negative words) / Total sentiment words"),
+        ("NLPS", "compound",
+         "NLTK VADER compound sentiment score, ranges -1 to 1"),
+        ("LLM (RoBERTa)", "llm_sentiment",
+         "Twitter-RoBERTa sentiment score (P(pos) - P(neg)), ranges -1 to 1"),
+        ("DistilRoBERTa", "distilroberta_sentiment",
+         "Financial-news DistilRoBERTa score (P(pos) - P(neg)), ranges -1 to 1"),
+        ("FinBERT", "finbert_sentiment",
+         "FinBERT financial sentiment score (P(pos) - P(neg)), ranges -1 to 1"),
+    ]
     green = PatternFill(start_color="1FA84C", end_color="1FA84C", fill_type="solid")
     amber = PatternFill(start_color="F4A300", end_color="F4A300", fill_type="solid")
     red = PatternFill(start_color="D93A3A", end_color="D93A3A", fill_type="solid")
-    for num_cell, num_txt, lbl_cell, lbl_txt, val_cell, val, desc_cell, desc_txt in labels:
-        ws[num_cell] = num_txt
-        ws[lbl_cell] = lbl_txt
-        ws[lbl_cell].font = Font(bold=True, size=16)
-        ws[desc_cell] = desc_txt
+
+    for n, (lbl_txt, column, desc_txt) in enumerate(score_rows, start=1):
+        r = 7 + (n - 1) * 3
+        val = df[column].mean()
+        ws[f"A{r}"] = f"{n}-"
+        ws[f"B{r}"] = lbl_txt
+        ws[f"B{r}"].font = Font(bold=True, size=16)
+        ws[f"C{r}"] = desc_txt
+        val_cell = f"F{r + 1}"
         ws[val_cell] = round(float(val), 3) if pd.notna(val) else 0
         ws[val_cell].font = Font(bold=True, size=16)
         ws.conditional_formatting.add(val_cell, CellIsRule(operator="greaterThanOrEqual", formula=["0.5"], fill=green))
         ws.conditional_formatting.add(val_cell, CellIsRule(operator="greaterThanOrEqual", formula=["0.25"], fill=amber))
         ws.conditional_formatting.add(val_cell, CellIsRule(operator="lessThan", formula=["0.25"], fill=red))
 
-    ws["B18"] = "Score Time Series"
-    ws["B18"].font = Font(color="6E1E33", bold=True, size=16)
-    ws.add_image(XLImage(ts_buf), "B19")
+    ws["B24"] = "Score Time Series"
+    ws["B24"].font = Font(color="6E1E33", bold=True, size=16)
+    ws.add_image(XLImage(ts_buf), "B25")
     if bubble_buf is not None:
-        ws.add_image(XLImage(bubble_buf), "B60")
+        ws.add_image(XLImage(bubble_buf), "B66")
 
     out = io.BytesIO()
     wb.save(out)
@@ -1812,8 +1502,8 @@ if run_clicked:
     st.session_state.results = {}
 
     st.session_state.colors = None
-        
-    vader, tokenizer, config, model = load_engines()
+
+    vader, hf_models = load_engines()
 
     for comp in st.session_state.companies:
         name = (comp.get("name") or "").strip().upper()
@@ -1861,8 +1551,8 @@ if run_clicked:
                 status.update(label=f"{name}: no articles found in this date range", state="error")
                 continue
 
-            scored_df = score_sentiment(raw_df, custom_words, vader, tokenizer, config, model)
-            log(f"Sentiment Scoring Completed")
+            scored_df = score_sentiment(raw_df, custom_words, vader, hf_models)
+            log("Sentiment Scoring Completed")
             if scored_df.empty:
                 status.update(label=f"{name}: no usable articles after cleanup", state="error")
                 continue
@@ -1875,8 +1565,6 @@ if run_clicked:
                 "end": comp["end_date"],
             }
             status.update(label=f"{name}: analysis complete ✅", state="complete")
-
-            # time.sleep(3)
 
 # ----------------------------------------------------------------------------
 # Results (always shown upfront if present in session state)
@@ -1909,16 +1597,15 @@ if st.session_state.results:
             # error when the same widgets/charts are rendered once per company.
             key_id = f"{idx}_{safe_key(cname)}"
 
-            avg_nps, avg_nlps, avg_llm = df["NPS"].mean(), df["compound"].mean(), df["llm_sentiment"].mean()
-
-            k1, k2, k3, k4 = st.columns(4)
-            kpi_defs = [
-                ("News Items", f"{len(df)}", BOB_MAROON),
-                ("NPS (avg)", f"{avg_nps:.2f}", BUCKET_COLOR[risk_bucket(avg_nps)]),
-                ("NLPS — VADER (avg)", f"{avg_nlps:.2f}", BUCKET_COLOR[risk_bucket(avg_nlps)]),
-                ("LLM — RoBERTa (avg)", f"{avg_llm:.2f}", BUCKET_COLOR[risk_bucket(avg_llm)]),
-            ]
-            for col, (label, val, color) in zip([k1, k2, k3, k4], kpi_defs):
+            # KPI cards: news count + the five sentiment scores
+            k_cols = st.columns(6)
+            kpi_defs = [("News Items", f"{len(df)}", BOB_MAROON)]
+            for label, column in SCORE_TYPE_OPTIONS.items():
+                avg_val = df[column].mean()
+                kpi_defs.append(
+                    (f"{label} (avg)", f"{avg_val:.2f}", BUCKET_COLOR[risk_bucket(avg_val)])
+                )
+            for col, (label, val, color) in zip(k_cols, kpi_defs):
                 col.markdown(
                     f'<div class="kpi-card" style="background:{color};">'
                     f'<div class="kpi-label">{label}</div>'
